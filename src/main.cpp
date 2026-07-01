@@ -10,20 +10,23 @@
 #include <vector>
 #include <fcntl.h>
 #include <map>
+#include "ThreadPool.h"
 
 const int PORT = 8080;
 const int BACKLOG = 8;
-const int BUFFER_SIZE = 4096;
+const int BUFFER_SIZE = 8;
 const int MAX_EVENTS = 64; // epoll 最大事件数
+const int THREAD_POOL_SIZE = 4; // 线程池大小
 
 class EpollServer {
 public:
     // 构造函数
     EpollServer(int port = PORT) 
-        : _port(port), 
-          _listen_fd(-1), 
-          _epoll_fd(-1), 
-          _is_running(false) {
+        : port_(port), 
+          listen_fd_(-1), 
+          epoll_fd_(-1), 
+          is_running_(false),
+          thread_pool_(THREAD_POOL_SIZE) {
         setupSignalHandler();
     }
     
@@ -35,79 +38,79 @@ public:
     // 初始化服务器：创建 socket、设置 SO_REUSEADDR、bind、listen
     bool init() {
         // 1. 创建 socket
-        _listen_fd = socket(AF_INET, SOCK_STREAM, 0);
-        if (_listen_fd < 0) {
+        listen_fd_ = socket(AF_INET, SOCK_STREAM, 0);
+        if (listen_fd_ < 0) {
             perror("socket creation failed");
             return false;
         }
-        std::cout << "Socket created successfully (fd: " << _listen_fd << ")" << std::endl;
+        std::cout << "Socket created successfully (fd: " << listen_fd_ << ")" << std::endl;
         
         // 2. 设置 SO_REUSEADDR
         if (!setReuseAddr()) {
-            close(_listen_fd);
-            _listen_fd = -1;
+            close(listen_fd_);
+            listen_fd_ = -1;
             return false;
         }
         
         // 3. bind 到 0.0.0.0:port
         if (!bindAddress()) {
-            close(_listen_fd);
-            _listen_fd = -1;
+            close(listen_fd_);
+            listen_fd_ = -1;
             return false;
         }
         
         // 4. listen
         if (!startListen()) {
-            close(_listen_fd);
-            _listen_fd = -1;
+            close(listen_fd_);
+            listen_fd_ = -1;
             return false;
         }
 
         // 5. 创建 epoll 实例
-        _epoll_fd = epoll_create1(0);
-        if (_epoll_fd < 0) {
+        epoll_fd_ = epoll_create1(0);
+        if (epoll_fd_ < 0) {
             perror("epoll_create1 failed");
-            close(_listen_fd);
-            _listen_fd = -1;
+            close(listen_fd_);
+            listen_fd_ = -1;
             return false;
         }
 
-        std::cout << "Epoll instance created successfully (fd: " << _epoll_fd << ")" << std::endl;
+        std::cout << "Epoll instance created successfully (fd: " << epoll_fd_ << ")" << std::endl;
 
         // 6. 将监听 socket 添加到 epoll
         struct epoll_event ev;
         ev.events = EPOLLIN; // 可读事件
-        ev.data.fd = _listen_fd;
-        if (epoll_ctl(_epoll_fd, EPOLL_CTL_ADD, _listen_fd, &ev) < 0) {
+        ev.data.fd = listen_fd_;
+        if (epoll_ctl(epoll_fd_, EPOLL_CTL_ADD, listen_fd_, &ev) < 0) {
             perror("epoll_ctl ADD listen_fd failed");
-            close(_listen_fd);
-            close(_epoll_fd);
-            _listen_fd = -1;
-            _epoll_fd = -1;
+            close(listen_fd_);
+            close(epoll_fd_);
+            listen_fd_ = -1;
+            epoll_fd_ = -1;
             return false;
         }
         std::cout << "Listening socket added to epoll" << std::endl;
         
-        _is_running = true;
+        is_running_ = true;
         return true;
     }
     
     // 启动服务器主循环
     void run() {
-        if (!_is_running) {
+        if (!is_running_) {
             std::cerr << "Server not initialized. Call init() first." << std::endl;
             return;
         }
         
         std::cout << "----------------------------------------" << std::endl;
-        std::cout << "Server is running on 0.0.0.0:" << _port << std::endl;
+        std::cout << "Server is running on 0.0.0.0:" << port_ << std::endl;
         std::cout << "Waiting for client connections..." << std::endl;
         std::cout << "----------------------------------------" << std::endl;
         
         struct epoll_event events[MAX_EVENTS];
 
-        while(_is_running) {
-            int nfds = epoll_wait(_epoll_fd, events, MAX_EVENTS, -1);
+        while(is_running_) {
+            int nfds = epoll_wait(epoll_fd_, events, MAX_EVENTS, -1);
             if (nfds < 0) {
                 if (errno == EINTR) {
                     continue; // 被信号中断，继续等待
@@ -127,7 +130,7 @@ public:
                 }
 
                 // 新的客户端连接
-                if(fd == _listen_fd) {
+                if(fd == listen_fd_) {
                     handleNewConnection();
                 } else if(events[i].events & EPOLLIN) { //socket 有可读事件
                     handleClientData(fd);
@@ -139,19 +142,19 @@ public:
     
     // 停止服务器
     void shutdown() {
-        _is_running = false;
-        if (_listen_fd >= 0) {
-            close(_listen_fd);
-            _listen_fd = -1;
+        is_running_ = false;
+        if (listen_fd_ >= 0) {
+            close(listen_fd_);
+            listen_fd_ = -1;
             std::cout << "Listen socket closed" << std::endl;
         }
-        if (_epoll_fd >= 0) {
-            close(_epoll_fd);
-            _epoll_fd = -1;
+        if (epoll_fd_ >= 0) {
+            close(epoll_fd_);
+            epoll_fd_ = -1;
             std::cout << "Server socket closed" << std::endl;
         }
         //关闭所有客户端连接
-        for(auto& pair : _clients) {
+        for(auto& pair : clients_) {
             close(pair.first);
         }
         std::cout << "All client connections closed" << std::endl;
@@ -159,14 +162,14 @@ public:
     
     // 检查服务器是否在运行
     bool isRunning() const {
-        return _is_running;
+        return is_running_;
     }
 
 private:
     // 设置 SO_REUSEADDR 选项
     bool setReuseAddr() {
         int optval = 1;
-        if (setsockopt(_listen_fd, SOL_SOCKET, SO_REUSEADDR, &optval, sizeof(optval)) < 0) {
+        if (setsockopt(listen_fd_, SOL_SOCKET, SO_REUSEADDR, &optval, sizeof(optval)) < 0) {
             perror("setsockopt SO_REUSEADDR failed");
             return false;
         }
@@ -179,20 +182,20 @@ private:
         struct sockaddr_in server_addr;
         memset(&server_addr, 0, sizeof(server_addr));
         server_addr.sin_family = AF_INET;
-        server_addr.sin_port = htons(_port);
+        server_addr.sin_port = htons(port_);
         server_addr.sin_addr.s_addr = INADDR_ANY;  // 0.0.0.0
         
-        if (bind(_listen_fd, (struct sockaddr*)&server_addr, sizeof(server_addr)) < 0) {
+        if (bind(listen_fd_, (struct sockaddr*)&server_addr, sizeof(server_addr)) < 0) {
             perror("bind failed");
             return false;
         }
-        std::cout << "Bound to 0.0.0.0:" << _port << std::endl;
+        std::cout << "Bound to 0.0.0.0:" << port_ << std::endl;
         return true;
     }
     
     // 开始监听
     bool startListen() {
-        if (listen(_listen_fd, BACKLOG) < 0) {
+        if (listen(listen_fd_, BACKLOG) < 0) {
             perror("listen failed");
             return false;
         }
@@ -205,7 +208,7 @@ private:
         struct sockaddr_in client_addr;
         socklen_t client_addr_len = sizeof(client_addr);
         
-        int client_fd = accept(_listen_fd, (struct sockaddr*)&client_addr, &client_addr_len);
+        int client_fd = accept(listen_fd_, (struct sockaddr*)&client_addr, &client_addr_len);
         if (client_fd < 0) {
             perror("accept failed");
             return;
@@ -225,14 +228,14 @@ private:
         struct epoll_event ev;
         ev.events = EPOLLIN | EPOLLET; // 边缘触发模式
         ev.data.fd = client_fd;
-        if (epoll_ctl(_epoll_fd, EPOLL_CTL_ADD, client_fd, &ev) < 0) {
+        if (epoll_ctl(epoll_fd_, EPOLL_CTL_ADD, client_fd, &ev) < 0) {
             perror("epoll_ctl ADD client_fd failed");
             close(client_fd);
             return;
         }
         
         // 保存客户端信息
-        _clients[client_fd] = {client_addr, ""};
+        clients_[client_fd] = {client_addr, "", false};
     }
     
     // 处理客户端请求（回显服务器）
@@ -242,18 +245,30 @@ private:
         
         // 边缘触发模式需要循环读取，直到 EAGAIN
         while(true) {
-            bytes_read = read(fd, buffer, sizeof(buffer-1));
+            bytes_read = read(fd, buffer, sizeof(buffer)-1);
             if(bytes_read > 0) {
                 buffer[bytes_read] = '\0';
+                clients_[fd].buffer.append(buffer, bytes_read);
                 std::cout << "Received from client (fd: " << fd << "): " << buffer;
-
-                ssize_t bytes_write = write(fd, buffer, bytes_read);
-                if(bytes_write < 0) {
-                    perror("write to client failed");
-                    closeConnection(fd);
-                    break;
+                
+                // 将处理任务提交给线程池
+                if(clients_[fd].processing == false) {
+                    clients_[fd].processing = true;
+                    thread_pool_.submit([this, fd]() {
+                        std::string& data = clients_[fd].buffer;
+                        // 模拟处理数据（这里直接回显）
+                        ssize_t bytes_written = write(fd, data.c_str(), data.size());
+                        if(bytes_written < 0) {
+                            perror("write to client failed");
+                            closeConnection(fd);
+                        } else {
+                            std::cout << "Echoed back to client (fd: " << fd << "): " << data;
+                            data.clear(); // 清空缓冲区
+                        }
+                        clients_[fd].processing = false;
+                    });
                 }
-                std::cout << "Echoed back to client (fd: " << fd << "): " << buffer;
+                
             }
             else if(bytes_read == 0) {
                 std::cout << "Client (fd: " << fd << ") disconnected" << std::endl;
@@ -277,9 +292,9 @@ private:
     void closeConnection(int fd) {
         // 从 epoll 中移除
         if (fd >= 0) {
-            epoll_ctl(_epoll_fd, EPOLL_CTL_DEL, fd, nullptr);
+            epoll_ctl(epoll_fd_, EPOLL_CTL_DEL, fd, nullptr);
             close(fd);
-            _clients.erase(fd);
+            clients_.erase(fd);
             std::cout << "  Closed fd " << fd << std::endl;
         }
     }
@@ -293,21 +308,25 @@ private:
     
 private:
     struct ClientInfo {
-        struct sockaddr_in addr;
-        std::string buffer;
+        struct sockaddr_in addr;        // 客户端地址
+        std::string buffer;          // 缓冲区
+        bool processing;
     };
 
-    int _port;
-    int _listen_fd;
-    int _epoll_fd;
-    bool _is_running;
-    std::map<int, ClientInfo> _clients;
+    int port_;
+    int listen_fd_;
+    int epoll_fd_;
+    bool is_running_;
+    std::map<int, ClientInfo> clients_;
+    ThreadPool thread_pool_;
+    
 };
 
 // ============== 主函数 ==============
 int main() {
     // 创建服务器实例
     EpollServer server(PORT);
+    
     
     // 初始化服务器
     if (!server.init()) {
